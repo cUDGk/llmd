@@ -78,7 +78,13 @@ fn health_ok(port: u16) -> bool {
     }
     let mut buf = [0u8; 256];
     match s.read(&mut buf) {
-        Ok(n) => std::str::from_utf8(&buf[..n]).map(|r| r.contains(" 200")).unwrap_or(false),
+        // Only the status line counts (llama-server: "HTTP/1.1 200 OK", or 503 while loading),
+        // so a "200" elsewhere in headers can't false-positive.
+        Ok(n) => std::str::from_utf8(&buf[..n])
+            .ok()
+            .and_then(|r| r.lines().next())
+            .map(|l| l.contains(" 200"))
+            .unwrap_or(false),
         Err(_) => false,
     }
 }
@@ -88,18 +94,37 @@ fn pid_alive(pid: i64) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
 }
 
+// Confirm a pid is still the process we think it is. Pids recycle fast under Android's
+// low-memory killer, so a bare /proc check can report an unrelated app as "our" server.
+fn pid_is(pid: i64, needle: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .map(|s| s.replace('\0', " ").contains(needle))
+        .unwrap_or(false)
+}
+
 fn read_pid(dir: &PathBuf, name: &str) -> Option<i64> {
     std::fs::read_to_string(dir.join(name)).ok()?.trim().parse().ok()
 }
 
 fn cmd_run(a: &[String]) -> R<()> {
+    let extra = passthrough(a);
+    // Parse llmd's own options only from before `--`; everything after is llama-server's,
+    // so a passthrough flag (e.g. `-- --port 9`) can't hijack llmd's own --port/--state.
+    let cut = a.iter().position(|x| x == "--").unwrap_or(a.len());
+    let a = &a[..cut];
     let server = opt(a, "--server").ok_or("run needs --server <llama-server path>")?;
     let model = opt(a, "--model").ok_or("run needs --model <gguf path>")?;
     let port: u16 = opt(a, "--port").and_then(|s| s.parse().ok()).unwrap_or(8080);
     let dir = state_dir(a);
     let log = opt(a, "--log").map(String::from);
-    let extra = passthrough(a);
     std::fs::create_dir_all(&dir)?;
+    // Refuse a second supervisor on the same state dir — both would fight for the port
+    // and only the last llmd.pid would be recorded, leaking the other.
+    if let Some(pid) = read_pid(&dir, "llmd.pid") {
+        if pid_alive(pid) && pid_is(pid, "llmd") {
+            return Err(format!("llmd already running (pid {pid}); run `stop` first").into());
+        }
+    }
     std::fs::write(dir.join("llmd.pid"), std::process::id().to_string())?;
 
     let logline = move |msg: &str| {
@@ -123,7 +148,8 @@ fn cmd_run(a: &[String]) -> R<()> {
             .spawn()
             .map_err(|e| format!("spawn {server}: {e}"))?;
         let child_pid = child.id();
-        std::fs::write(dir.join("server.pid"), child_pid.to_string())?;
+        // Non-fatal: a transient FS error here must not abort the loop and orphan the child.
+        let _ = std::fs::write(dir.join("server.pid"), child_pid.to_string());
         logline(&format!("spawned llama-server pid={child_pid}"));
 
         // Watch the child: report ready on first healthy /health, respawn on exit.
@@ -135,7 +161,9 @@ fn cmd_run(a: &[String]) -> R<()> {
             }
             if !announced && health_ok(port) {
                 announced = true;
-                backoff = 1; // a successful load resets the backoff
+                // NB: do NOT reset backoff here. A server that loads, serves briefly, then
+                // OOM-crashes would otherwise loop every 1s. Only sustained uptime (below)
+                // resets it.
                 logline(&format!("ready: OpenAI API on http://127.0.0.1:{port}/v1"));
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -154,9 +182,10 @@ fn cmd_run(a: &[String]) -> R<()> {
 fn cmd_status(a: &[String]) -> R<()> {
     let dir = state_dir(a);
     let port: u16 = opt(a, "--port").and_then(|s| s.parse().ok()).unwrap_or(8080);
-    let sup = read_pid(&dir, "llmd.pid").map(pid_alive).unwrap_or(false);
+    // AND an identity check so a recycled pid isn't reported as our process.
+    let sup = read_pid(&dir, "llmd.pid").map(|p| pid_alive(p) && pid_is(p, "llmd")).unwrap_or(false);
     let srv_pid = read_pid(&dir, "server.pid");
-    let srv = srv_pid.map(pid_alive).unwrap_or(false);
+    let srv = srv_pid.map(|p| pid_alive(p) && pid_is(p, "llama")).unwrap_or(false);
     let healthy = health_ok(port);
     println!(
         "supervisor={} server={} (pid={}) health={} endpoint=http://127.0.0.1:{}/v1",
@@ -175,14 +204,29 @@ fn yn(b: bool) -> &'static str {
 
 fn cmd_stop(a: &[String]) -> R<()> {
     let dir = state_dir(a);
-    // Kill the supervisor first so it can't respawn the server we're about to kill.
-    for name in ["llmd.pid", "server.pid"] {
-        if let Some(pid) = read_pid(&dir, name) {
-            if pid_alive(pid) {
-                let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
-                println!("killed {name} pid={pid}");
+    // Kill the supervisor FIRST and wait for it to actually exit, otherwise it could
+    // respawn the server in the gap between our two kills (and overwrite server.pid).
+    if let Some(pid) = read_pid(&dir, "llmd.pid") {
+        if pid_alive(pid) && pid_is(pid, "llmd") {
+            let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+            for _ in 0..40 {
+                if !pid_alive(pid) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100)); // up to ~4s
             }
+            println!("stopped supervisor pid={pid}");
         }
     }
+    // Now the (current) server pid is stable; kill it if it's really llama-server.
+    if let Some(pid) = read_pid(&dir, "server.pid") {
+        if pid_alive(pid) && pid_is(pid, "llama") {
+            let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+            println!("stopped server pid={pid}");
+        }
+    }
+    // Remove pidfiles so a later `status` can't read a recycled pid as "up".
+    let _ = std::fs::remove_file(dir.join("llmd.pid"));
+    let _ = std::fs::remove_file(dir.join("server.pid"));
     Ok(())
 }
